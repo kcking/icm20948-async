@@ -7,6 +7,8 @@ use nalgebra::Vector3;
 mod reg;
 use crate::reg::*;
 
+mod dmp;
+
 const MAGNET_ADDR: u8 = 0x0C; // I2C address of magnetometer
 
 #[derive(Clone, Copy)]
@@ -47,6 +49,7 @@ pub struct MagDisabled;
 // Compile-time init states
 pub struct Init;
 pub struct NotInit;
+pub struct DmpInit;
 
 // Type to hold bus information for I2c
 pub struct IcmBusI2c<I2C> {

@@ -24,6 +24,7 @@ pub enum Bank0 {
     IntEnable2 = 0x12,
     IntEnable3 = 0x13,
     I2cMstStatus = 0x17,
+    DmpIntStatus = 0x18,
     IntStatus = 0x19,
     IntStatus1 = 0x1A,
     IntStatus2 = 0x1B,
@@ -43,9 +44,14 @@ pub enum Bank0 {
     FifoRst = 0x68,
     FifoMode = 0x69,
     FifoCounth = 0x70,
+    FifoCountl = 0x71,
     FifoRW = 0x72,
     DataRdyStatus = 0x74,
     FifoCfg = 0x76,
+    MemStartAddr = 0x7C,
+    MemRW = 0x7D,
+    MemBankSel = 0x7E,
+    RegBankSel = 0x7F,
 }
 
 #[allow(unused)]
@@ -94,6 +100,10 @@ pub enum Bank3 {
     I2cSlv0Reg = 0x04,
     I2cSlv0Ctrl = 0x05,
     I2cSlv0Do = 0x06,
+    I2cSlv1Addr = 0x07,
+    I2cSlv1Reg = 0x08,
+    I2cSlv1Ctrl = 0x09,
+    I2cSlv1Do = 0x0A,
 }
 
 pub trait Register {
