@@ -176,6 +176,89 @@ where
 
         self.write_to(Bank0::SingleFifoPrioritySel, 0xE4).await?;
 
+        const ACCEL_SCALE: u16 = 30 * 16;
+        self.write_mems(ACCEL_SCALE, &[0x04, 0x00, 0x00, 0x00])
+            .await?;
+
+        const ACCEL_SCALE2: u16 = 79 * 16 + 4;
+        self.write_mems(ACCEL_SCALE2, &[0x00, 0x04, 0x00, 0x00])
+            .await?;
+
+        const CPASS_MTX_00: u16 = 23 * 16;
+        let mount_mult_zero = &[0u8, 0, 0, 0];
+        let mount_mult_plus = &[0x09, 0x99, 0x99, 0x99];
+        let mount_mult_minus = &[0xf6, 0x66, 0x66, 0x67];
+        self.write_mems(CPASS_MTX_00, mount_mult_plus).await?;
+        self.write_mems(CPASS_MTX_00 + 4, mount_mult_zero).await?;
+        self.write_mems(CPASS_MTX_00 + 8, mount_mult_zero).await?;
+        self.write_mems(CPASS_MTX_00 + 12, mount_mult_zero).await?;
+        self.write_mems(CPASS_MTX_00 + 16, mount_mult_minus).await?;
+        self.write_mems(CPASS_MTX_00 + 20, mount_mult_zero).await?;
+        self.write_mems(CPASS_MTX_00 + 24, mount_mult_zero).await?;
+        self.write_mems(CPASS_MTX_00 + 28, mount_mult_zero).await?;
+        self.write_mems(CPASS_MTX_00 + 32, mount_mult_minus).await?;
+
+        const B2S_MTX_00: u16 = 208 * 16;
+        let b2s_mount_mult_zero = &[0x00, 0x00, 0x00, 0x00];
+        let b2s_mount_mult_plus = &[0x40, 0x00, 0x00, 0x00];
+        self.write_mems(B2S_MTX_00, b2s_mount_mult_plus).await?;
+        self.write_mems(B2S_MTX_00 + 4, b2s_mount_mult_zero).await?;
+        self.write_mems(B2S_MTX_00 + 8, b2s_mount_mult_zero).await?;
+        self.write_mems(B2S_MTX_00 + 12, b2s_mount_mult_zero)
+            .await?;
+        self.write_mems(B2S_MTX_00 + 16, b2s_mount_mult_plus)
+            .await?;
+        self.write_mems(B2S_MTX_00 + 20, b2s_mount_mult_zero)
+            .await?;
+        self.write_mems(B2S_MTX_00 + 24, b2s_mount_mult_zero)
+            .await?;
+        self.write_mems(B2S_MTX_00 + 28, b2s_mount_mult_zero)
+            .await?;
+        self.write_mems(B2S_MTX_00 + 32, b2s_mount_mult_plus)
+            .await?;
+
+        // Configure the DMP Gyro Scaling Factor
+        let [pll] = self.read_from(Bank1::TimebaseCorrectionPll).await?;
+        const MAGIC_CONSTANT: u64 = 264446880937391;
+        const MAGIC_CONSTANT_SCALE: u64 = 100000;
+        const GYRO_LEVEL: u64 = 4;
+        let result_ll: u64;
+        let div = 19u64;
+        if pll & 0x80 != 0x00 {
+            result_ll = MAGIC_CONSTANT * (1u64 << GYRO_LEVEL) * (1 + div)
+                / (1270 - ((pll as u64) & 0x7Fu64))
+                / MAGIC_CONSTANT_SCALE;
+        } else {
+            result_ll = MAGIC_CONSTANT * (1u64 << GYRO_LEVEL) * (1 + div)
+                / (1270 + pll as u64)
+                / MAGIC_CONSTANT_SCALE;
+        }
+        let gyro_sf = result_ll.min(0x7FFFFFFF) as u32;
+        const GYRO_SF: u16 = 19 * 16;
+        self.write_mems(GYRO_SF, &gyro_sf.to_be_bytes()).await?;
+
+        const GYRO_FULLSCALE: u16 = 72 * 16 + 12;
+        self.write_mems(GYRO_FULLSCALE, &[0x10, 0x00, 0x00, 0x00])
+            .await?;
+
+        const ACCEL_ONLY_GAIN: u16 = 16 * 16 + 12;
+        self.write_mems(ACCEL_ONLY_GAIN, &[0x03, 0xa4, 0x92, 0x49])
+            .await?;
+
+        const ACCEL_ALPHA_VAR: u16 = 91 * 16;
+        self.write_mems(ACCEL_ALPHA_VAR, &[0x34, 0x92, 0x49, 0x25])
+            .await?;
+
+        const ACCEL_A_VAR: u16 = 92 * 16;
+        self.write_mems(ACCEL_A_VAR, &[0x0B, 0x6D, 0xB6, 0xDB])
+            .await?;
+
+        const ACCEL_CAL_RATE: u16 = 94 * 16 + 4;
+        self.write_mems(ACCEL_CAL_RATE, &[0x00, 0x00]).await?;
+
+        const CPASS_TIME_BUFFER: u16 = 112 * 16 + 14;
+        self.write_mems(CPASS_TIME_BUFFER, &[0x00, 0x45]).await?;
+
         
 
         Ok(())
