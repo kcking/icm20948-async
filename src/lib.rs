@@ -499,6 +499,14 @@ where
         self.bus.bus_write(&[cmd.reg(), data]).await
     }
 
+    async fn write_two<R: Register + Copy>(&mut self, cmd: R, data: [u8; 2]) -> Result<(), E> {
+        self.set_user_bank(&cmd, false).await?;
+        let mut to_write = [0u8; 3];
+        to_write[0] = cmd.reg();
+        to_write[1..].clone_from_slice(&data);
+        self.bus.bus_write(&to_write).await
+    }
+
     /// Write to a register, but only overwrite the parts corresponding to the flag byte
     async fn write_to_flag<R>(&mut self, cmd: R, data: u8, flag: u8) -> Result<(), E>
     where

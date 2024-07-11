@@ -29,6 +29,7 @@ pub enum Bank0 {
     IntStatus1 = 0x1A,
     IntStatus2 = 0x1B,
     IntStatus3 = 0x1C,
+    SingleFifoPrioritySel = 0x26,
     DelayTimeh = 0x28,
     DelayTimel = 0x29,
     AccelXoutH = 0x2D,
@@ -47,6 +48,7 @@ pub enum Bank0 {
     FifoCountl = 0x71,
     FifoRW = 0x72,
     DataRdyStatus = 0x74,
+    HwFixDisable = 0x75,
     FifoCfg = 0x76,
     MemStartAddr = 0x7C,
     MemRW = 0x7D,
@@ -85,6 +87,7 @@ pub enum Bank2 {
     AccelWomThrCtrl = 0x13,
     AccelConfig = 0x14,
     AccelConfig2 = 0x15,
+    PrgmStartAddr = 0x50,
     FsyncConfig = 0x52,
     TempConfig = 0x53,
     ModCtrlUsr = 0x54,
@@ -155,6 +158,8 @@ impl Register for Bank3 {
 #[derive(Copy, Clone)]
 pub enum MagBank {
     DeviceId = 0x01,
+    Rsv1 = 0x02,
+    Rsv2 = 0x03,
     Status1 = 0x10,
     XDataLow = 0x11,
     YDataLow = 0x13,
