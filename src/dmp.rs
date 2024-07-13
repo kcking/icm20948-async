@@ -10,6 +10,91 @@ const FIRMWARE: &[u8] = include_bytes!("dmp.raw");
 const MAX_SERIAL_WRITE: usize = 16;
 const DMP_LOAD_START: u8 = 0x90;
 const DMP_START_ADDR: u16 = 0x1000;
+const DMP_MOTION_EVENT_CONTROL_ACCEL_CALIBR: u16 = 0x0200;
+const DMP_MOTION_EVENT_CONTROL_GYRO_CALIBR: u16 = 0x0100;
+const DMP_MOTION_EVENT_CONTROL_COMPASS_CALIBR: u16 = 0x0080;
+const DMP_DATA_OUT_CTL: u16 = 4 * 16;
+const DMP_DATA_OUT_CTL2: u16 = 4 * 16 + 2;
+const DMP_MOTION_EVENT_CTL: u16 = 4 * 16 + 14;
+const DATA_RDY_STATUS: u16 = 8 * 16 + 10; // 16-bit: indicates to DMP which sensors are available
+
+const INV_ANDROID_SENSOR_TO_CONTROL_BITS: &[u16] = &[
+    // Data output control 1 register bit definition
+    // 16-bit accel                                0x8000
+    // 16-bit gyro                                 0x4000
+    // 16-bit compass                              0x2000
+    // 16-bit ALS                                  0x1000
+    // 32-bit 6-axis quaternion                    0x0800
+    // 32-bit 9-axis quaternion + heading accuracy 0x0400
+    // 16-bit pedometer quaternion                 0x0200
+    // 32-bit Geomag rv + heading accuracy         0x0100
+    // 16-bit Pressure                             0x0080
+    // 32-bit calibrated gyro                      0x0040
+    // 32-bit calibrated compass                   0x0020
+    // Pedometer Step Detector                     0x0010
+    // Header 2                                    0x0008
+    // Pedometer Step Indicator Bit 2              0x0004
+    // Pedometer Step Indicator Bit 1              0x0002
+    // Pedometer Step Indicator Bit 0              0x0001
+    // Unsupported Sensors are 0xFFFF
+    0xFFFF, // 0  Meta Data
+    0x8008, // 1  Accelerometer
+    0x0028, // 2  Magnetic Field
+    0x0408, // 3  Orientation
+    0x4048, // 4  Gyroscope
+    0x1008, // 5  Light
+    0x0088, // 6  Pressure
+    0xFFFF, // 7  Temperature
+    0xFFFF, // 8  Proximity <----------- fixme
+    0x0808, // 9  Gravity
+    0x8808, // 10 Linear Acceleration
+    0x0408, // 11 Rotation Vector
+    0xFFFF, // 12 Humidity
+    0xFFFF, // 13 Ambient Temperature
+    0x2008, // 14 Magnetic Field Uncalibrated
+    0x0808, // 15 Game Rotation Vector
+    0x4008, // 16 Gyroscope Uncalibrated
+    0x0000, // 17 Significant Motion
+    0x0018, // 18 Step Detector
+    0x0010, // 19 Step Counter <----------- fixme
+    0x0108, // 20 Geomagnetic Rotation Vector
+    0xFFFF, // 21 ANDROID_SENSOR_HEART_RATE,
+    0xFFFF, // 22 ANDROID_SENSOR_PROXIMITY,
+    0x8008, // 23 ANDROID_SENSOR_WAKEUP_ACCELEROMETER,
+    0x0028, // 24 ANDROID_SENSOR_WAKEUP_MAGNETIC_FIELD,
+    0x0408, // 25 ANDROID_SENSOR_WAKEUP_ORIENTATION,
+    0x4048, // 26 ANDROID_SENSOR_WAKEUP_GYROSCOPE,
+    0x1008, // 27 ANDROID_SENSOR_WAKEUP_LIGHT,
+    0x0088, // 28 ANDROID_SENSOR_WAKEUP_PRESSURE,
+    0x0808, // 29 ANDROID_SENSOR_WAKEUP_GRAVITY,
+    0x8808, // 30 ANDROID_SENSOR_WAKEUP_LINEAR_ACCELERATION,
+    0x0408, // 31 ANDROID_SENSOR_WAKEUP_ROTATION_VECTOR,
+    0xFFFF, // 32 ANDROID_SENSOR_WAKEUP_RELATIVE_HUMIDITY,
+    0xFFFF, // 33 ANDROID_SENSOR_WAKEUP_AMBIENT_TEMPERATURE,
+    0x2008, // 34 ANDROID_SENSOR_WAKEUP_MAGNETIC_FIELD_UNCALIBRATED,
+    0x0808, // 35 ANDROID_SENSOR_WAKEUP_GAME_ROTATION_VECTOR,
+    0x4008, // 36 ANDROID_SENSOR_WAKEUP_GYROSCOPE_UNCALIBRATED,
+    0x0018, // 37 ANDROID_SENSOR_WAKEUP_STEP_DETECTOR,
+    0x0010, // 38 ANDROID_SENSOR_WAKEUP_STEP_COUNTER,
+    0x0108, // 39 ANDROID_SENSOR_WAKEUP_GEOMAGNETIC_ROTATION_VECTOR
+    0xFFFF, // 40 ANDROID_SENSOR_WAKEUP_HEART_RATE,
+    0x0000, // 41 ANDROID_SENSOR_WAKEUP_TILT_DETECTOR,
+    0x8008, // 42 Raw Acc
+    0x4048, // 43 Raw Gyr
+];
+
+#[repr(u8)]
+enum DmpSensor {
+    Orientation = 18,
+}
+
+impl DmpSensor {
+    fn to_android_sensor(&self) -> u8 {
+        match self {
+            DmpSensor::Orientation => 3,
+        }
+    }
+}
 
 enum Peripheral {
     Zero,
@@ -259,8 +344,47 @@ where
         const CPASS_TIME_BUFFER: u16 = 112 * 16 + 14;
         self.write_mems(CPASS_TIME_BUFFER, &[0x00, 0x45]).await?;
 
-        
+        Ok(())
+    }
 
+    async fn enable_dmp_sensor(&mut self, sensor: DmpSensor) -> Result<(), crate::IcmError<E>> {
+        self.set_low_power(false).await?;
+        let android_sensor = sensor.to_android_sensor();
+        let delta: u16 = INV_ANDROID_SENSOR_TO_CONTROL_BITS
+            .get(android_sensor as usize)
+            .cloned()
+            .ok_or(IcmError::MagSetupError)?;
+
+        // assume all sensors needed for now
+        const DMP_MOTION_EVENT_CONTROL_9AXIS: u16 = 0x0040;
+
+        let event_control: u16 = DMP_MOTION_EVENT_CONTROL_ACCEL_CALIBR
+            | DMP_MOTION_EVENT_CONTROL_GYRO_CALIBR
+            | DMP_MOTION_EVENT_CONTROL_COMPASS_CALIBR
+            | DMP_MOTION_EVENT_CONTROL_9AXIS;
+        const DMP_DATA_READY_ACCEL: u16 = 0x0002;
+        const DMP_DATA_READY_GYRO: u16 = 0x0001;
+        const DMP_DATA_READY_SECONDARY_COMPASS: u16 = 0x0008;
+        let data_rdy_status: u16 =
+            DMP_DATA_READY_ACCEL | DMP_DATA_READY_GYRO | DMP_DATA_READY_SECONDARY_COMPASS;
+        let data_output_control = delta;
+        const DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY: u16 = 0x4000;
+        const DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY: u16 = 0x2000;
+        const DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY: u16 = 0x1000;
+
+        let data_output_control_2 = DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY
+            | DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY
+            | DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY;
+        self.write_mems(DMP_DATA_OUT_CTL, &data_output_control.to_be_bytes())
+            .await?;
+        self.write_mems(DMP_DATA_OUT_CTL2, &data_output_control_2.to_be_bytes())
+            .await?;
+        self.write_mems(DATA_RDY_STATUS, &data_rdy_status.to_be_bytes())
+            .await?;
+        self.write_mems(DMP_MOTION_EVENT_CTL, &event_control.to_be_bytes())
+            .await?;
+
+        self.set_low_power(true).await?;
         Ok(())
     }
 
@@ -312,11 +436,7 @@ where
     }
 
     async fn load_dmp_firmware(&mut self) -> Result<(), E> {
-        // Disable lowpower
-        let [pwr_mgmt] = self.read_from(Bank0::PwrMgmt1).await?;
-        let mut pwr_mgmt = PwrMgmt1(pwr_mgmt);
-        pwr_mgmt.set_lp_en(false);
-        self.write_to(Bank0::PwrMgmt1, pwr_mgmt.0).await?;
+        self.set_low_power(false).await?;
 
         let data = FIRMWARE;
         let mut write_start = data;
@@ -332,11 +452,7 @@ where
             write_addr += write_size as u16;
         }
 
-        // Enable lowpower
-        let [pwr_mgmt] = self.read_from(Bank0::PwrMgmt1).await?;
-        let mut pwr_mgmt = PwrMgmt1(pwr_mgmt);
-        pwr_mgmt.set_lp_en(true);
-        self.write_to(Bank0::PwrMgmt1, pwr_mgmt.0).await?;
+        self.set_low_power(true).await?;
 
         Ok(())
     }
@@ -364,6 +480,14 @@ where
             bytes_written += to_write;
             reg += to_write as u16;
         }
+        Ok(())
+    }
+
+    async fn set_low_power(&mut self, enable: bool) -> Result<(), E> {
+        let [pwr_mgmt] = self.read_from(Bank0::PwrMgmt1).await?;
+        let mut pwr_mgmt = PwrMgmt1(pwr_mgmt);
+        pwr_mgmt.set_lp_en(enable);
+        self.write_to(Bank0::PwrMgmt1, pwr_mgmt.0).await?;
         Ok(())
     }
 }
