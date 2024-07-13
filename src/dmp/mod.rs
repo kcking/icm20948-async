@@ -3,10 +3,13 @@
 
 use bitfield::bitfield;
 use embedded_hal_async::i2c::Operation;
+use nalgebra::Quaternion;
 
 use crate::*;
 
-const FIRMWARE: &[u8] = include_bytes!("dmp.raw");
+mod blob;
+use blob::DMP_FIRWARE_BLOB;
+
 const MAX_SERIAL_WRITE: usize = 16;
 const DMP_LOAD_START: u8 = 0x90;
 const DMP_START_ADDR: u16 = 0x1000;
@@ -84,7 +87,7 @@ const INV_ANDROID_SENSOR_TO_CONTROL_BITS: &[u16] = &[
 ];
 
 #[repr(u8)]
-enum DmpSensor {
+pub enum DmpSensor {
     Orientation = 18,
 }
 
@@ -347,7 +350,7 @@ where
         Ok(())
     }
 
-    async fn enable_dmp_sensor(&mut self, sensor: DmpSensor) -> Result<(), crate::IcmError<E>> {
+    pub async fn enable_dmp_sensor(&mut self, sensor: DmpSensor) -> Result<(), crate::IcmError<E>> {
         self.set_low_power(false).await?;
         let android_sensor = sensor.to_android_sensor();
         let delta: u16 = INV_ANDROID_SENSOR_TO_CONTROL_BITS
@@ -388,6 +391,18 @@ where
         Ok(())
     }
 
+    pub async fn set_dmp_odr(&mut self) -> Result<(), E> {
+        self.set_low_power(false).await?;
+        const ODR_QUAT9: u16 = 10 * 16 + 8;
+        const ODR_CNTR_QUAT9: u16 = 8 * 16 + 8;
+        // Can be changed based on this equation:
+        // https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary/blob/9a10c510ddb694f08aa93c12d586358cb45abd2b/src/util/ICM_20948_C.c#L1621.
+        self.write_mems(ODR_QUAT9, &[0, 0]).await?;
+        self.write_mems(ODR_CNTR_QUAT9, &[0, 0]).await?;
+
+        Ok(())
+    }
+
     async fn set_fifo(&mut self, enable: bool) -> Result<(), E> {
         let [user_ctrl] = self.read_from(Bank0::UserCtrl).await?;
         let mut user_ctrl = UserCtrlVal(user_ctrl);
@@ -402,6 +417,24 @@ where
         self.write_to(Bank0::UserCtrl, user_ctrl.0).await?;
         Ok(())
     }
+
+    async fn reset_dmp(&mut self) -> Result<(), E> {
+        let [user_ctrl] = self.read_from(Bank0::UserCtrl).await?;
+        let mut user_ctrl = UserCtrlVal(user_ctrl);
+        user_ctrl.set_dmp_rst(true);
+        self.write_to(Bank0::UserCtrl, user_ctrl.0).await?;
+        Ok(())
+    }
+
+    async fn reset_fifo(&mut self) -> Result<(), E> {
+        let [mut fifo_rst] = self.read_from(Bank0::FifoRst).await?;
+        fifo_rst |= 0x1F;
+        self.write_to(Bank0::FifoRst, fifo_rst).await?;
+        fifo_rst = (fifo_rst & !0x1F) | 0x1E;
+        self.write_to(Bank0::FifoRst, fifo_rst).await?;
+        Ok(())
+    }
+
     async fn set_full_scale(&mut self, accel: bool, gyro: bool) -> Result<(), E> {
         if accel {
             let [acc_config] = self.read_from(Bank2::AccelConfig).await?;
@@ -438,13 +471,16 @@ where
     async fn load_dmp_firmware(&mut self) -> Result<(), E> {
         self.set_low_power(false).await?;
 
-        let data = FIRMWARE;
+        let data = DMP_FIRWARE_BLOB;
         let mut write_start = data;
         let mut write_addr = DMP_LOAD_START as u16;
         while write_start.len() > 0 {
             let mut write_size = write_start.len().min(MAX_SERIAL_WRITE);
             if (write_addr & 0xff) + (write_size as u16) > 0x100 {
                 write_size = ((write_addr & 0xff) + (write_size as u16) - 0x100) as usize;
+            }
+            if write_size == 0 {
+                panic!("write size zero");
             }
             self.write_mems(write_addr, &write_start[..write_size])
                 .await?;
@@ -465,20 +501,30 @@ where
             let start_addr = (reg & 0xff) as u8;
             self.write_to(Bank0::MemStartAddr, start_addr).await?;
 
-            let to_write = data.len().min(MAX_SERIAL_WRITE);
-            self.bus.bus_write(&[Bank0::MemRW.reg()]).await?;
-            self.bus
-                .bus_inner
-                .transaction(
-                    self.bus.address.get(),
-                    &mut [
-                        Operation::Write(&[Bank0::MemRW.reg()]),
-                        Operation::Write(&data[bytes_written..bytes_written + to_write]),
-                    ],
-                )
-                .await?;
+            let to_write = (data.len() - bytes_written).min(MAX_SERIAL_WRITE);
+            self.set_user_bank(&Bank0::MemRW, false).await?;
+            // Pack register and data in to buf.
+            let mut buf = [0u8; MAX_SERIAL_WRITE + 1];
+            buf[0] = Bank0::MemRW.reg();
+            buf[1..to_write + 1].copy_from_slice(&data[bytes_written..bytes_written + to_write]);
+            self.bus.bus_write(&buf[..to_write + 1]).await?;
+            // self.bus
+            //     .bus_inner
+            //     .transaction(
+            //         self.bus.address.get(),
+            //         &mut [
+            //             Operation::Write(&[Bank0::MemRW.reg()]),
+            //             Operation::Write(&data[bytes_written..bytes_written + to_write]),
+            //         ],
+            //     )
+            //     .await?;
             bytes_written += to_write;
-            reg += to_write as u16;
+            if let Some(next) = reg.checked_add(to_write as u16) {
+                reg = next;
+            } else {
+                panic!("{}", bytes_written);
+            }
+            // reg += to_write as u16;
         }
         Ok(())
     }
@@ -489,6 +535,166 @@ where
         pwr_mgmt.set_lp_en(enable);
         self.write_to(Bank0::PwrMgmt1, pwr_mgmt.0).await?;
         Ok(())
+    }
+
+    async fn set_sleep(&mut self, enable: bool) -> Result<(), E> {
+        let [pwr_mgmt] = self.read_from(Bank0::PwrMgmt1).await?;
+        let mut pwr_mgmt = PwrMgmt1(pwr_mgmt);
+        pwr_mgmt.set_sleep(enable);
+        self.write_to(Bank0::PwrMgmt1, pwr_mgmt.0).await?;
+        Ok(())
+    }
+    async fn reset(&mut self) -> Result<(), E> {
+        let [pwr_mgmt] = self.read_from(Bank0::PwrMgmt1).await?;
+        let mut pwr_mgmt = PwrMgmt1(pwr_mgmt);
+        pwr_mgmt.set_device_reset(true);
+        self.write_to(Bank0::PwrMgmt1, pwr_mgmt.0).await?;
+        Ok(())
+    }
+
+    pub async fn full_dmp_setup(&mut self) -> Result<(), IcmError<E>> {
+        // self.reset().await?;
+        // self.delay.delay_ms(50).await;
+        self.set_sleep(false).await?;
+        self.load_dmp().await?;
+        self.enable_dmp_sensor(DmpSensor::Orientation).await?;
+        self.set_dmp_odr().await?;
+        self.set_fifo(true).await?;
+        self.set_dmp(true).await?;
+        self.reset_dmp().await?;
+        self.reset_fifo().await?;
+        Ok(())
+    }
+    pub async fn read_dmp(&mut self) -> Result<Option<Quaternion<f64>>, E> {
+        const MAX_DMP_BYTES: usize = 14;
+        const DMP_HEADER_BYTES: u16 = 2u16;
+        const DMP_HEADER2_BYTES: u16 = 2u16;
+        const DMP_HEADER_BITMAP_HEADER2: u16 = 0x0008;
+        const DMP_HEADER_BITMAP_ACCEL: u16 = 0x8000;
+        const DMP_HEADER_BITMAP_GYRO: u16 = 0x4000;
+        const DMP_HEADER_BITMAP_COMPASS: u16 = 0x2000;
+        const DMP_HEADER_BITMAP_ALS: u16 = 0x1000;
+        const DMP_HEADER_BITMAP_QUAT6: u16 = 0x0800;
+        const DMP_HEADER_BITMAP_QUAT9: u16 = 0x0400;
+        const DMP_HEADER_BITMAP_PQUAT6: u16 = 0x0200;
+        const DMP_HEADER_BITMAP_GEOMAG: u16 = 0x0100;
+        const DMP_HEADER_BITMAP_PRESSURE: u16 = 0x0080;
+        const DMP_HEADER_BITMAP_GYRO_CALIB: u16 = 0x0040;
+        const DMP_HEADER_BITMAP_COMPASS_CALIB: u16 = 0x0020;
+        const DMP_HEADER_BITMAP_STEP_DETECTOR: u16 = 0x0010;
+
+        let mut out: Option<Quaternion<f64>> = None;
+
+        let mut count = self.fifo_count().await?;
+        if count < DMP_HEADER_BYTES {
+            return Ok(None);
+        }
+
+        let [header_hi, header_lo] = self.fifo_read().await?;
+        let header = u16::from_be_bytes([header_hi, header_lo]);
+        count -= DMP_HEADER_BYTES;
+
+        let header2 = if header & DMP_HEADER_BITMAP_HEADER2 > 0 {
+            if count < DMP_HEADER2_BYTES {
+                count = self.fifo_count().await?;
+                if count < DMP_HEADER2_BYTES {
+                    return Ok(None);
+                }
+            }
+            let [header_hi, header_lo] = self.fifo_read().await?;
+            let header2 = u16::from_be_bytes([header_hi, header_lo]);
+            Some(header2)
+        } else {
+            None
+        };
+        // TODO: will these panic if fifo is not adequately filled?
+        if header & DMP_HEADER_BITMAP_ACCEL > 0 {
+            let _: [u8; 6] = self.fifo_read().await?;
+        }
+        if header & DMP_HEADER_BITMAP_GYRO > 0 {
+            let _: [u8; 12] = self.fifo_read().await?;
+        }
+        if header & DMP_HEADER_BITMAP_COMPASS > 0 {
+            let _: [u8; 6] = self.fifo_read().await?;
+        }
+        if header & DMP_HEADER_BITMAP_ALS > 0 {
+            let _: [u8; 8] = self.fifo_read().await?;
+        }
+        if header & DMP_HEADER_BITMAP_QUAT6 > 0 {
+            let _: [u8; 12] = self.fifo_read().await?;
+        }
+        if header & DMP_HEADER_BITMAP_QUAT9 > 0 {
+            let quat9_bytes: [u8; 14] = self.fifo_read().await?;
+            let q1 =
+                u32::from_le_bytes(quat9_bytes[0..4].try_into().unwrap()) as f64 / 1073741824.0;
+            let q2 =
+                u32::from_le_bytes(quat9_bytes[4..8].try_into().unwrap()) as f64 / 1073741824.0;
+            let q3 =
+                u32::from_le_bytes(quat9_bytes[8..12].try_into().unwrap()) as f64 / 1073741824.0;
+            use num_traits::Float;
+            let q0: f64 = (1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3))).sqrt();
+
+            let accuracy = u16::from_le_bytes(quat9_bytes[12..14].try_into().unwrap());
+            let q = nalgebra::Quaternion::from_parts(q0, [q1, q2, q3].into());
+            out = Some(q)
+        }
+
+        if header & DMP_HEADER_BITMAP_PQUAT6 > 0 {
+            let _: [u8; 6] = self.fifo_read().await?;
+        }
+        if header & DMP_HEADER_BITMAP_GEOMAG > 0 {
+            let _: [u8; 14] = self.fifo_read().await?;
+        }
+        if header & DMP_HEADER_BITMAP_PRESSURE > 0 {
+            let _: [u8; 6] = self.fifo_read().await?;
+        }
+        if header & DMP_HEADER_BITMAP_GYRO_CALIB > 0 {}
+        if header & DMP_HEADER_BITMAP_COMPASS_CALIB > 0 {
+            let _: [u8; 12] = self.fifo_read().await?;
+        }
+        if header & DMP_HEADER_BITMAP_STEP_DETECTOR > 0 {
+            let _: [u8; 4] = self.fifo_read().await?;
+        }
+
+        if let Some(header2) = header2 {
+            let skipped_header2_bits_and_lens: &[(u16, usize)] = &[
+                (0x4000, 2),
+                (0x2000, 2),
+                (0x1000, 2),
+                (0x0400, 2),
+                (0x0080, 6),
+                (0x0040, 2),
+            ];
+
+            for (skip_mask, skip_len) in skipped_header2_bits_and_lens {
+                if header2 & skip_mask > 0 {
+                    for _ in 0..*skip_len {
+                        if (count as usize) < *skip_len {
+                            count = self.fifo_count().await?;
+                            if (count as usize) < *skip_len {
+                                return Ok(None);
+                            }
+                        }
+                        // TODO: is this slow?
+                        let [_] = self.fifo_read().await?;
+                    }
+                }
+            }
+        }
+
+        let _footer: [u8; 2] = self.fifo_read().await?;
+
+        Ok(out)
+    }
+
+    async fn fifo_count(&mut self) -> Result<u16, E> {
+        let [high] = self.read_from(Bank0::FifoCounth).await?;
+        let [low] = self.read_from(Bank0::FifoCountl).await?;
+        Ok(((high as u16) << 8) + low as u16)
+    }
+
+    async fn fifo_read<const N: usize>(&mut self) -> Result<[u8; N], E> {
+        self.read_from(Bank0::FifoRW).await
     }
 }
 
@@ -625,5 +831,6 @@ bitfield! {
     struct PwrMgmt1(u8);
     _, set_clk_sel: 2, 0;
     _, set_lp_en: 5;
-
+    _, set_sleep: 6;
+    _, set_device_reset: 7;
 }
