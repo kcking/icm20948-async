@@ -215,10 +215,13 @@ where
         .await?;
 
         self.write_to(Bank3::I2cMstOdrConfig, 0x04).await?;
+
+        // set clock source auto
         let [pwr_mgmt] = self.read_from(Bank0::PwrMgmt1).await?;
         let mut pwr_mgmt = PwrMgmt1(pwr_mgmt);
         pwr_mgmt.set_clk_sel(0x01);
         self.write_to(Bank0::PwrMgmt1, pwr_mgmt.0).await?;
+
         self.write_to(Bank0::PwrMgmt2, 0x40).await?;
 
         // Set i2c master to cycled sample mode
@@ -226,11 +229,13 @@ where
         let mut lp_config = LpConfigVal(lp_config);
         lp_config.set_i2c_mst(true);
         self.write_to(Bank0::LpConfig, lp_config.0).await?;
+        self.delay.delay_ms(1).await;
 
         self.set_fifo(false).await?;
         self.set_dmp(false).await?;
 
         self.set_full_scale(true, true).await?;
+        // gyro DLPF
         self.enable_gyro_fchoice().await?;
 
         self.write_to(Bank0::FifoEn1, 0).await?;
@@ -240,15 +245,14 @@ where
         self.write_to(Bank0::FifoRst, 1).await?;
 
         self.set_sample_rate(&SampleRateConfig {
-            accel: 16,
-            gyro: 16,
+            accel: 19,
+            gyro: 19,
         })
         .await?;
 
-        let start_addr = DMP_START_ADDR;
         self.write_two(
             Bank2::PrgmStartAddr,
-            [(start_addr >> 8) as u8, start_addr as u8],
+            [(DMP_START_ADDR >> 8) as u8, (DMP_START_ADDR & 0xFF) as u8],
         )
         .await?;
 
