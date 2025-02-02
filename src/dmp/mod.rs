@@ -361,10 +361,12 @@ where
         let delta: u16 = INV_ANDROID_SENSOR_TO_CONTROL_BITS
             .get(android_sensor as usize)
             .cloned()
-            .ok_or(IcmError::MagSetupError)?;
+            .ok_or(IcmError::DmpSetupError)?;
 
         // assume all sensors needed for now
         const DMP_MOTION_EVENT_CONTROL_9AXIS: u16 = 0x0040;
+
+        // ACTUALLY we assume just quat9 + header2 for now (that's delta for Orientation)
 
         let event_control: u16 = DMP_MOTION_EVENT_CONTROL_ACCEL_CALIBR
             | DMP_MOTION_EVENT_CONTROL_GYRO_CALIBR
@@ -380,9 +382,10 @@ where
         const DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY: u16 = 0x2000;
         const DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY: u16 = 0x1000;
 
-        let data_output_control_2 = DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY
-            | DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY
-            | DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY;
+        let data_output_control_2 = 
+        // DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY
+        //     | DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY
+            DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY;
         self.write_mems(DMP_DATA_OUT_CTL, &data_output_control.to_be_bytes())
             .await?;
         self.write_mems(DMP_DATA_OUT_CTL2, &data_output_control_2.to_be_bytes())
@@ -397,6 +400,7 @@ where
     }
 
     pub async fn set_dmp_odr(&mut self) -> Result<(), E> {
+        self.set_sleep(false).await?;
         self.set_low_power(false).await?;
         const ODR_QUAT9: u16 = 10 * 16 + 8;
         const ODR_CNTR_QUAT9: u16 = 8 * 16 + 8;
@@ -404,6 +408,7 @@ where
         // https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary/blob/9a10c510ddb694f08aa93c12d586358cb45abd2b/src/util/ICM_20948_C.c#L1621.
         self.write_mems(ODR_QUAT9, &[0, 0]).await?;
         self.write_mems(ODR_CNTR_QUAT9, &[0, 0]).await?;
+        self.set_low_power(true).await?;
 
         Ok(())
     }
@@ -601,7 +606,7 @@ where
         self.reset_fifo().await?;
         Ok(())
     }
-    pub async fn read_dmp(&mut self) -> Result<(Option<Quaternion<f64>>, Option<u16>), E> {
+    pub async fn read_dmp(&mut self) -> Result<(Option<((f64, f64, f64), u16)>, Option<u16>), E> {
         const MAX_DMP_BYTES: usize = 14;
         const DMP_HEADER_BYTES: u16 = 2u16;
         const DMP_HEADER2_BYTES: u16 = 2u16;
@@ -619,7 +624,7 @@ where
         const DMP_HEADER_BITMAP_COMPASS_CALIB: u16 = 0x0020;
         const DMP_HEADER_BITMAP_STEP_DETECTOR: u16 = 0x0010;
 
-        let mut out: Option<Quaternion<f64>> = None;
+        let mut out: Option<((f64, f64, f64), u16)> = None;
 
         let mut count = self.fifo_count().await?;
         if count < DMP_HEADER_BYTES {
@@ -662,17 +667,17 @@ where
         if header & DMP_HEADER_BITMAP_QUAT9 > 0 {
             let quat9_bytes: [u8; 14] = self.fifo_read().await?;
             let q1 =
-                u32::from_le_bytes(quat9_bytes[0..4].try_into().unwrap()) as f64 / 1073741824.0;
+                u32::from_be_bytes(quat9_bytes[0..4].try_into().unwrap()) as f64 / 1073741824.0;
             let q2 =
-                u32::from_le_bytes(quat9_bytes[4..8].try_into().unwrap()) as f64 / 1073741824.0;
+                u32::from_be_bytes(quat9_bytes[4..8].try_into().unwrap()) as f64 / 1073741824.0;
             let q3 =
-                u32::from_le_bytes(quat9_bytes[8..12].try_into().unwrap()) as f64 / 1073741824.0;
+                u32::from_be_bytes(quat9_bytes[8..12].try_into().unwrap()) as f64 / 1073741824.0;
             use num_traits::Float as _;
             let q0: f64 = (1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3))).sqrt();
 
-            let accuracy = u16::from_le_bytes(quat9_bytes[12..14].try_into().unwrap());
+            let accuracy = u16::from_be_bytes(quat9_bytes[12..14].try_into().unwrap());
             let q = nalgebra::Quaternion::from_parts(q0, [q1, q2, q3].into());
-            out = Some(q)
+            out = Some(((q1, q2, q3), accuracy))
         }
 
         if header & DMP_HEADER_BITMAP_PQUAT6 > 0 {
@@ -724,8 +729,8 @@ where
     }
 
     pub async fn fifo_count(&mut self) -> Result<u16, E> {
-        let [high] = self.read_from(Bank0::FifoCounth).await?;
-        let [low] = self.read_from(Bank0::FifoCountl).await?;
+        let [high, low] = self.read_from(Bank0::FifoCounth).await?;
+        // let [low] = self.read_from(Bank0::FifoCountl).await?;
         Ok(((high as u16) << 8) + low as u16)
     }
 
