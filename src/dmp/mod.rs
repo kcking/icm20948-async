@@ -253,6 +253,7 @@ where
         .await?;
 
         self.load_dmp_firmware().await?;
+        self.verify_dmp_firmware().await?;
 
         self.write_two(
             Bank2::PrgmStartAddr,
@@ -478,6 +479,7 @@ where
             let mut write_size = write_start.len().min(MAX_SERIAL_WRITE);
             if (write_addr & 0xff) + (write_size as u16) > 0x100 {
                 write_size = ((write_addr & 0xff) + (write_size as u16) - 0x100) as usize;
+                // write_size = (0x100 - (write_addr & 0xff)) as usize;
             }
             if write_size == 0 {
                 panic!("write size zero");
@@ -489,6 +491,29 @@ where
         }
 
         self.set_low_power(true).await?;
+
+        Ok(())
+    }
+
+    async fn verify_dmp_firmware(&mut self) -> Result<(), E> {
+        let mut expected_data = DMP_FIRWARE_BLOB;
+        let mut read_loc = DMP_LOAD_START as usize;
+
+        while !expected_data.is_empty() {
+            let mut read_len = expected_data.len().min(MAX_SERIAL_WRITE);
+            if (read_loc & 0xff) + read_len > 0x100 {
+                // Moved across a bank
+                read_len = (read_loc & 0xff) + read_len - 0x100;
+            }
+            let mut buf = &mut [0u8; MAX_SERIAL_WRITE][..read_len];
+            self.read_mems(read_loc as u16, &mut buf).await?;
+            if buf != &expected_data[..read_len] {
+                panic!("OHNO");
+            }
+            expected_data = &expected_data[read_len..];
+            read_loc += read_len;
+        }
+        // panic!("DONE :) ");
 
         Ok(())
     }
@@ -508,24 +533,31 @@ where
             buf[0] = Bank0::MemRW.reg();
             buf[1..to_write + 1].copy_from_slice(&data[bytes_written..bytes_written + to_write]);
             self.bus.bus_write(&buf[..to_write + 1]).await?;
-            // self.bus
-            //     .bus_inner
-            //     .transaction(
-            //         self.bus.address.get(),
-            //         &mut [
-            //             Operation::Write(&[Bank0::MemRW.reg()]),
-            //             Operation::Write(&data[bytes_written..bytes_written + to_write]),
-            //         ],
-            //     )
-            //     .await?;
             bytes_written += to_write;
             if let Some(next) = reg.checked_add(to_write as u16) {
                 reg = next;
             } else {
                 panic!("{}", bytes_written);
             }
-            // reg += to_write as u16;
+            // NOTE: this loop is currently only ever executed once since the caller limits writes to MAX_SERIAL_WRITE
+            reg += to_write as u16;
         }
+        Ok(())
+    }
+
+    async fn read_mems(&mut self, mut reg: u16, mut buf: &mut [u8]) -> Result<(), E> {
+        self.write_to(Bank0::MemBankSel, (reg >> 8) as u8).await?;
+
+        while !buf.is_empty() {
+            self.write_to(Bank0::MemStartAddr, (reg & 0xff) as u8)
+                .await?;
+            let read_len = buf.len().min(MAX_SERIAL_WRITE) as usize;
+            self.read_slice_from(Bank0::MemRW, &mut buf[..read_len])
+                .await?;
+            buf = &mut buf[read_len..];
+            reg += read_len as u16;
+        }
+
         Ok(())
     }
 
@@ -565,7 +597,7 @@ where
         self.reset_fifo().await?;
         Ok(())
     }
-    pub async fn read_dmp(&mut self) -> Result<Option<Quaternion<f64>>, E> {
+    pub async fn read_dmp(&mut self) -> Result<(Option<Quaternion<f64>>, Option<u16>), E> {
         const MAX_DMP_BYTES: usize = 14;
         const DMP_HEADER_BYTES: u16 = 2u16;
         const DMP_HEADER2_BYTES: u16 = 2u16;
@@ -587,7 +619,7 @@ where
 
         let mut count = self.fifo_count().await?;
         if count < DMP_HEADER_BYTES {
-            return Ok(None);
+            return Ok((None, None));
         }
 
         let [header_hi, header_lo] = self.fifo_read().await?;
@@ -598,7 +630,7 @@ where
             if count < DMP_HEADER2_BYTES {
                 count = self.fifo_count().await?;
                 if count < DMP_HEADER2_BYTES {
-                    return Ok(None);
+                    return Ok((None, Some(header)));
                 }
             }
             let [header_hi, header_lo] = self.fifo_read().await?;
@@ -631,7 +663,7 @@ where
                 u32::from_le_bytes(quat9_bytes[4..8].try_into().unwrap()) as f64 / 1073741824.0;
             let q3 =
                 u32::from_le_bytes(quat9_bytes[8..12].try_into().unwrap()) as f64 / 1073741824.0;
-            use num_traits::Float;
+            use num_traits::Float as _;
             let q0: f64 = (1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3))).sqrt();
 
             let accuracy = u16::from_le_bytes(quat9_bytes[12..14].try_into().unwrap());
@@ -672,7 +704,7 @@ where
                         if (count as usize) < *skip_len {
                             count = self.fifo_count().await?;
                             if (count as usize) < *skip_len {
-                                return Ok(None);
+                                return Ok((None, Some(header)));
                             }
                         }
                         // TODO: is this slow?
@@ -684,10 +716,10 @@ where
 
         let _footer: [u8; 2] = self.fifo_read().await?;
 
-        Ok(out)
+        Ok((out, Some(header)))
     }
 
-    async fn fifo_count(&mut self) -> Result<u16, E> {
+    pub async fn fifo_count(&mut self) -> Result<u16, E> {
         let [high] = self.read_from(Bank0::FifoCounth).await?;
         let [low] = self.read_from(Bank0::FifoCountl).await?;
         Ok(((high as u16) << 8) + low as u16)

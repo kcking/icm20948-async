@@ -493,6 +493,16 @@ where
         Ok(buf)
     }
 
+    async fn read_slice_from<R: Register + Copy>(
+        &mut self,
+        cmd: R,
+        buf: &mut [u8],
+    ) -> Result<(), E> {
+        self.set_user_bank(&cmd, false).await?;
+        self.bus.bus_transfer(&[cmd.reg()], buf).await?;
+        Ok(())
+    }
+
     /// Write a single byte to the requeste register
     async fn write_to<R: Register + Copy>(&mut self, cmd: R, data: u8) -> Result<(), E> {
         self.set_user_bank(&cmd, false).await?;
@@ -1016,6 +1026,7 @@ pub enum IcmError<E> {
     BusError(E),
     ImuSetupError,
     MagSetupError,
+    DmpSetupError,
 }
 
 impl<E> From<E> for IcmError<E> {
