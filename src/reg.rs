@@ -157,7 +157,8 @@ impl Register for Bank3 {
 #[allow(unused)]
 #[derive(Copy, Clone)]
 pub enum MagBank {
-    DeviceId = 0x01,
+    Wia1 = 0x00,
+    DeviceId = 0x01, // aka Wia2?
     Rsv1 = 0x02,
     Rsv2 = 0x03,
     Status1 = 0x10,

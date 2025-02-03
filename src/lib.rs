@@ -488,7 +488,7 @@ where
         cmd: R,
     ) -> Result<[u8; N], E> {
         let mut buf = [0u8; N];
-        self.set_user_bank(&cmd, false).await?;
+        self.set_user_bank(&cmd, true).await?;
         self.bus.bus_transfer(&[cmd.reg()], &mut buf).await?;
         Ok(buf)
     }
@@ -498,19 +498,19 @@ where
         cmd: R,
         buf: &mut [u8],
     ) -> Result<(), E> {
-        self.set_user_bank(&cmd, false).await?;
+        self.set_user_bank(&cmd, true).await?;
         self.bus.bus_transfer(&[cmd.reg()], buf).await?;
         Ok(())
     }
 
     /// Write a single byte to the requeste register
     async fn write_to<R: Register + Copy>(&mut self, cmd: R, data: u8) -> Result<(), E> {
-        self.set_user_bank(&cmd, false).await?;
+        self.set_user_bank(&cmd, true).await?;
         self.bus.bus_write(&[cmd.reg(), data]).await
     }
 
     async fn write_two<R: Register + Copy>(&mut self, cmd: R, data: [u8; 2]) -> Result<(), E> {
-        self.set_user_bank(&cmd, false).await?;
+        self.set_user_bank(&cmd, true).await?;
         let mut to_write = [0u8; 3];
         to_write[0] = cmd.reg();
         to_write[1..].clone_from_slice(&data);

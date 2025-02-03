@@ -3,7 +3,7 @@
 
 use bitfield::bitfield;
 use embedded_hal_async::i2c::Operation;
-use nalgebra::Quaternion;
+use nalgebra::{Quaternion, UnitQuaternion};
 
 use crate::*;
 
@@ -229,7 +229,7 @@ where
         let mut lp_config = LpConfigVal(lp_config);
         lp_config.set_i2c_mst(true);
         self.write_to(Bank0::LpConfig, lp_config.0).await?;
-        self.delay.delay_ms(1).await;
+        self.delay.delay_ms(10).await;
 
         self.set_fifo(false).await?;
         self.set_dmp(false).await?;
@@ -312,11 +312,14 @@ where
 
         // Configure the DMP Gyro Scaling Factor
         let [pll] = self.read_from(Bank1::TimebaseCorrectionPll).await?;
+        // let pll = 0x18;
+        // panic!("pll: 0x{:x}", pll);
         const MAGIC_CONSTANT: u64 = 264446880937391;
         const MAGIC_CONSTANT_SCALE: u64 = 100000;
-        const GYRO_LEVEL: u64 = 4;
+        const GYRO_LEVEL: u64 = 4; // hard-coded in arduino lib
         let result_ll: u64;
-        let div = 19u64;
+        let div = 19u64; // NOTE: this must match the gyro sample rate scale factor
+                         // treat pll as signed
         if pll & 0x80 != 0x00 {
             result_ll = MAGIC_CONSTANT * (1u64 << GYRO_LEVEL) * (1 + div)
                 / (1270 - ((pll as u64) & 0x7Fu64))
@@ -382,10 +385,9 @@ where
         const DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY: u16 = 0x2000;
         const DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY: u16 = 0x1000;
 
-        let data_output_control_2 = 
-        // DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY
-        //     | DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY
-            DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY;
+        let data_output_control_2 = DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY
+            | DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY
+            | DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY;
         self.write_mems(DMP_DATA_OUT_CTL, &data_output_control.to_be_bytes())
             .await?;
         self.write_mems(DMP_DATA_OUT_CTL2, &data_output_control_2.to_be_bytes())
@@ -536,7 +538,7 @@ where
             self.write_to(Bank0::MemStartAddr, start_addr).await?;
 
             let to_write = (data.len() - bytes_written).min(MAX_SERIAL_WRITE);
-            self.set_user_bank(&Bank0::MemRW, false).await?;
+            self.set_user_bank(&Bank0::MemRW, true).await?;
             // Pack register and data in to buf.
             let mut buf = [0u8; MAX_SERIAL_WRITE + 1];
             buf[0] = Bank0::MemRW.reg();
@@ -593,11 +595,67 @@ where
         Ok(())
     }
 
+    async fn startup_mag(&mut self) -> Result<(), IcmError<E>> {
+        // disable master passthrough
+        let [int_cfg] = self.read_from(Bank0::IntPinCfg).await?;
+        let mut new_cfg = IntPinCfg(int_cfg);
+        new_cfg.set_bypass_en(false);
+        self.write_to(Bank0::IntPinCfg, new_cfg.0).await?;
+
+        // master enable
+        let [mst_ctrl] = self.read_from(Bank3::I2cMstCtrl).await?;
+        let mut new_mst_ctrl = MstCtrl(mst_ctrl);
+        new_mst_ctrl.set_mst_clk(0x7);
+        new_mst_ctrl.set_p_nsr(true);
+        self.write_to(Bank3::I2cMstCtrl, new_mst_ctrl.0).await?;
+        self.enable_i2c_master(true).await?;
+
+        // Configure slave address as magnetometer
+        self.write_to(Bank3::I2cSlv0Addr, MAGNET_ADDR).await?;
+
+        self.mag_write_to(MagBank::Control3.reg(), 1).await?;
+
+        let mut remaining_tries = 10;
+        loop {
+            if remaining_tries == 0 {
+                return Err(IcmError::DmpSetupError);
+            }
+            remaining_tries -= 1;
+            let [wia1] = self.mag_read_from(MagBank::Wia1).await?;
+            let [wia2] = self.mag_read_from(MagBank::DeviceId).await?;
+            const MAG_AK09916_WHO_AM_I: u16 = 0x4809;
+            if u16::from_be_bytes([wia1, wia2]) != MAG_AK09916_WHO_AM_I {
+                self.reset_i2c_master().await?;
+                self.delay.delay_ms(10).await;
+                continue;
+            }
+            break;
+        }
+
+        Ok(())
+    }
+
     pub async fn full_dmp_setup(&mut self) -> Result<(), IcmError<E>> {
+        // Minimal setup from arduino lib
+        // force bank 0 for first write
+        //TODO: this fixes WHO_AM_I, instead make sure we make current bank an optional to distinguish from 0!!
+        self.bus.bus_write(&[Bank0::RegBankSel.reg(), 0x00]).await?;
+        let [me] = self.read_from(Bank0::WhoAmI).await?;
+        if me != 0xEA {
+            return Err(IcmError::DmpSetupError);
+        }
+        self.reset().await?;
+        self.delay.delay_ms(50).await;
+        self.set_sleep(false).await?;
+        self.set_low_power(false).await?;
+
+        self.startup_mag().await?;
+
         // self.reset().await?;
         // self.delay.delay_ms(50).await;
         self.set_sleep(false).await?;
         self.load_dmp().await?;
+
         self.enable_dmp_sensor(DmpSensor::Orientation).await?;
         self.set_dmp_odr().await?;
         self.set_fifo(true).await?;
@@ -606,7 +664,10 @@ where
         self.reset_fifo().await?;
         Ok(())
     }
-    pub async fn read_dmp(&mut self) -> Result<(Option<((f64, f64, f64), u16)>, Option<u16>), E> {
+
+    pub async fn read_dmp(
+        &mut self,
+    ) -> Result<(Option<((f64, f64, f64), u16, (u32, u32, u32))>, Option<u16>), E> {
         const MAX_DMP_BYTES: usize = 14;
         const DMP_HEADER_BYTES: u16 = 2u16;
         const DMP_HEADER2_BYTES: u16 = 2u16;
@@ -624,7 +685,7 @@ where
         const DMP_HEADER_BITMAP_COMPASS_CALIB: u16 = 0x0020;
         const DMP_HEADER_BITMAP_STEP_DETECTOR: u16 = 0x0010;
 
-        let mut out: Option<((f64, f64, f64), u16)> = None;
+        let mut out: Option<((f64, f64, f64), u16, (u32, u32, u32))> = None;
 
         let mut count = self.fifo_count().await?;
         if count < DMP_HEADER_BYTES {
@@ -666,6 +727,11 @@ where
         }
         if header & DMP_HEADER_BITMAP_QUAT9 > 0 {
             let quat9_bytes: [u8; 14] = self.fifo_read().await?;
+            let q_ints = (
+                u32::from_be_bytes(quat9_bytes[0..4].try_into().unwrap()),
+                u32::from_be_bytes(quat9_bytes[4..8].try_into().unwrap()),
+                u32::from_be_bytes(quat9_bytes[8..12].try_into().unwrap()),
+            );
             let q1 =
                 u32::from_be_bytes(quat9_bytes[0..4].try_into().unwrap()) as f64 / 1073741824.0;
             let q2 =
@@ -677,7 +743,8 @@ where
 
             let accuracy = u16::from_be_bytes(quat9_bytes[12..14].try_into().unwrap());
             let q = nalgebra::Quaternion::from_parts(q0, [q1, q2, q3].into());
-            out = Some(((q1, q2, q3), accuracy))
+            UnitQuaternion::from_scaled_axis(Vector3::new(q1, q2, q3));
+            out = Some(((q1, q2, q3), accuracy, q_ints))
         }
 
         if header & DMP_HEADER_BITMAP_PQUAT6 > 0 {
@@ -710,9 +777,9 @@ where
             for (skip_mask, skip_len) in skipped_header2_bits_and_lens {
                 if header2 & skip_mask > 0 {
                     for _ in 0..*skip_len {
-                        if (count as usize) < *skip_len {
+                        if (count as usize) < 1 {
                             count = self.fifo_count().await?;
-                            if (count as usize) < *skip_len {
+                            if (count as usize) < 1 {
                                 return Ok((None, Some(header)));
                             }
                         }
@@ -874,4 +941,36 @@ bitfield! {
     _, set_lp_en: 5;
     _, set_sleep: 6;
     _, set_device_reset: 7;
+}
+
+bitfield! {
+    /*
+  {
+    uint8_t reserved_0 : 1;
+    uint8_t BYPASS_EN : 1;
+    uint8_t FSYNC_INT_MODE_EN : 1;
+    uint8_t ACTL_FSYNC : 1;
+    uint8_t INT_ANYRD_2CLEAR : 1;
+    uint8_t INT1_LATCH_EN : 1;
+    uint8_t INT1_OPEN : 1;
+    uint8_t INT1_ACTL : 1;
+  } ICM_20948_INT_PIN_CFG_t;
+
+     */
+    struct IntPinCfg(u8);
+    _, set_bypass_en: 1;
+}
+
+bitfield! {
+    /*
+  {
+    uint8_t I2C_MST_CLK : 4;
+    uint8_t I2C_MST_P_NSR : 1;
+    uint8_t reserved_0 : 2;
+    uint8_t MULT_MST_EN : 1;
+  } ICM_20948_I2C_MST_CTRL_t;
+    */
+    struct MstCtrl(u8);
+    _, set_mst_clk: 3, 0;
+    _, set_p_nsr: 4;
 }
