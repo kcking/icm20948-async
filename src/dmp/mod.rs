@@ -89,12 +89,14 @@ const INV_ANDROID_SENSOR_TO_CONTROL_BITS: &[u16] = &[
 #[repr(u8)]
 pub enum DmpSensor {
     Orientation = 18,
+    GameRotationVector = 9,
 }
 
 impl DmpSensor {
     fn to_android_sensor(&self) -> u8 {
         match self {
             DmpSensor::Orientation => 3,
+            DmpSensor::GameRotationVector => 35,
         }
     }
 }
@@ -151,15 +153,11 @@ where
         data_out: u8,
     ) -> Result<(), E> {
         let regs = peripheral.regs();
-        /*
-        {
-          uint8_t ID : 7;
-          uint8_t RNW : 1;
-        } ICM_20948_I2C_PERIPHX_ADDR_t;
-         */
-        let periphx_addr_val: u8 = (addr & !0x80) | ((rnw as u8) << 7);
+        let mut periphx_addr = PeriphxAddr(0);
+        periphx_addr.set_addr(addr);
+        periphx_addr.set_rnw(rnw);
 
-        self.write_to(regs.addr, periphx_addr_val).await?;
+        self.write_to(regs.addr, periphx_addr.0).await?;
 
         if !rnw {
             self.write_to(regs.r#do, data_out).await?;
@@ -368,26 +366,27 @@ where
 
         // assume all sensors needed for now
         const DMP_MOTION_EVENT_CONTROL_9AXIS: u16 = 0x0040;
+        const DMP_OUTPUT_CTRL_1_QUAT6: u16 = 0x0800;
 
         // ACTUALLY we assume just quat9 + header2 for now (that's delta for Orientation)
 
-        let event_control: u16 = DMP_MOTION_EVENT_CONTROL_ACCEL_CALIBR
-            | DMP_MOTION_EVENT_CONTROL_GYRO_CALIBR
-            | DMP_MOTION_EVENT_CONTROL_COMPASS_CALIBR
-            | DMP_MOTION_EVENT_CONTROL_9AXIS;
+        let event_control: u16 =
+            DMP_MOTION_EVENT_CONTROL_ACCEL_CALIBR | DMP_MOTION_EVENT_CONTROL_GYRO_CALIBR;
+        // | DMP_MOTION_EVENT_CONTROL_COMPASS_CALIBR;
+        // | DMP_MOTION_EVENT_CONTROL_9AXIS;
         const DMP_DATA_READY_ACCEL: u16 = 0x0002;
         const DMP_DATA_READY_GYRO: u16 = 0x0001;
         const DMP_DATA_READY_SECONDARY_COMPASS: u16 = 0x0008;
-        let data_rdy_status: u16 =
-            DMP_DATA_READY_ACCEL | DMP_DATA_READY_GYRO | DMP_DATA_READY_SECONDARY_COMPASS;
+        let data_rdy_status: u16 = DMP_DATA_READY_ACCEL | DMP_DATA_READY_GYRO;
+        // | DMP_DATA_READY_SECONDARY_COMPASS;
         let data_output_control = delta;
         const DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY: u16 = 0x4000;
         const DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY: u16 = 0x2000;
         const DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY: u16 = 0x1000;
 
-        let data_output_control_2 = DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY
-            | DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY
-            | DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY;
+        let data_output_control_2 =
+            DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY | DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY;
+        // | DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY;
         self.write_mems(DMP_DATA_OUT_CTL, &data_output_control.to_be_bytes())
             .await?;
         self.write_mems(DMP_DATA_OUT_CTL2, &data_output_control_2.to_be_bytes())
@@ -397,7 +396,7 @@ where
         self.write_mems(DMP_MOTION_EVENT_CTL, &event_control.to_be_bytes())
             .await?;
 
-        self.set_low_power(true).await?;
+        // self.set_low_power(true).await?;
         Ok(())
     }
 
@@ -410,6 +409,11 @@ where
         // https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary/blob/9a10c510ddb694f08aa93c12d586358cb45abd2b/src/util/ICM_20948_C.c#L1621.
         self.write_mems(ODR_QUAT9, &[0, 0]).await?;
         self.write_mems(ODR_CNTR_QUAT9, &[0, 0]).await?;
+
+        const ODR_QUAT6: u16 = 10 * 16 + 12;
+        const ODR_CNTR_QUAT6: u16 = 8 * 16 + 12;
+        self.write_mems(ODR_QUAT6, &[0, 0]).await?;
+        self.write_mems(ODR_CNTR_QUAT6, &[0, 0]).await?;
         self.set_low_power(true).await?;
 
         Ok(())
@@ -531,6 +535,9 @@ where
 
     async fn write_mems(&mut self, mut reg: u16, data: &[u8]) -> Result<(), E> {
         self.write_to(Bank0::MemBankSel, (reg >> 8) as u8).await?;
+        if (reg & 0xff) as usize + data.len() > 0x100 {
+            panic!();
+        }
 
         let mut bytes_written = 0;
         while bytes_written < data.len() {
@@ -612,6 +619,10 @@ where
 
         // Configure slave address as magnetometer
         self.write_to(Bank3::I2cSlv0Addr, MAGNET_ADDR).await?;
+        self.write_to(Bank3::I2cSlv0Reg, MagBank::XDataLow.reg())
+            .await?;
+        // Set expected read size
+        self.write_to(Bank3::I2cSlv0Ctrl, 1 << 7 | 8).await?;
 
         self.mag_write_to(MagBank::Control3.reg(), 1).await?;
 
@@ -656,7 +667,9 @@ where
         self.set_sleep(false).await?;
         self.load_dmp().await?;
 
-        self.enable_dmp_sensor(DmpSensor::Orientation).await?;
+        self.enable_dmp_sensor(DmpSensor::GameRotationVector)
+            .await?;
+        // self.enable_dmp_sensor(DmpSensor::Orientation).await?;
         self.set_dmp_odr().await?;
         self.set_fifo(true).await?;
         self.set_dmp(true).await?;
@@ -723,7 +736,20 @@ where
             let _: [u8; 8] = self.fifo_read().await?;
         }
         if header & DMP_HEADER_BITMAP_QUAT6 > 0 {
-            let _: [u8; 12] = self.fifo_read().await?;
+            // let _: [u8; 12] = self.fifo_read().await?;
+            let quat6_bytes: [u8; 12] = self.fifo_read().await?;
+            let q_ints = (
+                u32::from_be_bytes(quat6_bytes[0..4].try_into().unwrap()),
+                u32::from_be_bytes(quat6_bytes[4..8].try_into().unwrap()),
+                u32::from_be_bytes(quat6_bytes[8..12].try_into().unwrap()),
+            );
+            let q1 =
+                u32::from_be_bytes(quat6_bytes[0..4].try_into().unwrap()) as f64 / 1073741824.0;
+            let q2 =
+                u32::from_be_bytes(quat6_bytes[4..8].try_into().unwrap()) as f64 / 1073741824.0;
+            let q3 =
+                u32::from_be_bytes(quat6_bytes[8..12].try_into().unwrap()) as f64 / 1073741824.0;
+            out = Some(((q1, q2, q3), 0, q_ints))
         }
         if header & DMP_HEADER_BITMAP_QUAT9 > 0 {
             let quat9_bytes: [u8; 14] = self.fifo_read().await?;
@@ -973,4 +999,16 @@ bitfield! {
     struct MstCtrl(u8);
     _, set_mst_clk: 3, 0;
     _, set_p_nsr: 4;
+}
+
+/*
+{
+  uint8_t ID : 7;
+  uint8_t RNW : 1;
+} ICM_20948_I2C_PERIPHX_ADDR_t;
+ */
+bitfield! {
+    struct PeriphxAddr(u8);
+    _ , set_addr: 6, 0;
+    _ , set_rnw: 7;
 }
