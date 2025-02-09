@@ -1,7 +1,9 @@
+#![allow(unused)]
 // Guide:
 // https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary/blob/main/DMP.md#how-is-the-dmp-loaded-and-started
 
 use bitfield::bitfield;
+use defmt::info;
 use embedded_hal_async::i2c::Operation;
 use nalgebra::{Quaternion, UnitQuaternion};
 
@@ -13,9 +15,28 @@ use blob::DMP_FIRWARE_BLOB;
 const MAX_SERIAL_WRITE: usize = 16;
 const DMP_LOAD_START: u8 = 0x90;
 const DMP_START_ADDR: u16 = 0x1000;
-const DMP_MOTION_EVENT_CONTROL_ACCEL_CALIBR: u16 = 0x0200;
-const DMP_MOTION_EVENT_CONTROL_GYRO_CALIBR: u16 = 0x0100;
-const DMP_MOTION_EVENT_CONTROL_COMPASS_CALIBR: u16 = 0x0080;
+// Motion Event Control bits
+const DMP_MOTION_EVENT_CONTROL_ACCEL_CALIBR: u16 = 0x0001;
+const DMP_MOTION_EVENT_CONTROL_GYRO_CALIBR: u16 = 0x0002;
+const DMP_MOTION_EVENT_CONTROL_COMPASS_CALIBR: u16 = 0x0004;
+const DMP_MOTION_EVENT_CONTROL_9AXIS: u16 = 0x0008;
+
+// Data Output Control 1 bits
+const DMP_OUTPUT_CTRL_1_QUAT6: u16 = 0x0800;
+const DMP_OUTPUT_CTRL_1_QUAT9: u16 = 0x0400;
+const DMP_OUTPUT_CTRL_1_GEOMAG: u16 = 0x0100;
+const DMP_OUTPUT_CTRL_1_GYRO_CALIBR: u16 = 0x0040;
+const DMP_OUTPUT_CTRL_1_COMPASS_CALIBR: u16 = 0x0020;
+
+// Data Ready Status bits
+const DMP_DATA_READY_ACCEL: u16 = 0x0002;
+const DMP_DATA_READY_GYRO: u16 = 0x0001;
+const DMP_DATA_READY_SECONDARY_COMPASS: u16 = 0x0008;
+
+// Data Output Control 2 bits
+const DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY: u16 = 0x4000;
+const DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY: u16 = 0x2000;
+const DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY: u16 = 0x1000;
 const DMP_DATA_OUT_CTL: u16 = 4 * 16;
 const DMP_DATA_OUT_CTL2: u16 = 4 * 16 + 2;
 const DMP_MOTION_EVENT_CTL: u16 = 4 * 16 + 14;
@@ -226,6 +247,8 @@ where
         let [lp_config] = self.read_from(Bank0::LpConfig).await?;
         let mut lp_config = LpConfigVal(lp_config);
         lp_config.set_i2c_mst(true);
+        lp_config.set_accel(false);
+        lp_config.set_gyro(false);
         self.write_to(Bank0::LpConfig, lp_config.0).await?;
         self.delay.delay_ms(10).await;
 
@@ -358,35 +381,32 @@ where
 
     pub async fn enable_dmp_sensor(&mut self, sensor: DmpSensor) -> Result<(), crate::IcmError<E>> {
         self.set_low_power(false).await?;
+
+        // Set gyro and accel FSR before configuring DMP
+        self.set_full_scale(true, true).await?; // Make sure this sets Gyro to 2000dps and Accel to ±4g
+
         let android_sensor = sensor.to_android_sensor();
-        let delta: u16 = INV_ANDROID_SENSOR_TO_CONTROL_BITS
+        let data_output_control: u16 = INV_ANDROID_SENSOR_TO_CONTROL_BITS
             .get(android_sensor as usize)
             .cloned()
             .ok_or(IcmError::DmpSetupError)?;
 
-        // assume all sensors needed for now
-        const DMP_MOTION_EVENT_CONTROL_9AXIS: u16 = 0x0040;
-        const DMP_OUTPUT_CTRL_1_QUAT6: u16 = 0x0800;
-
-        // ACTUALLY we assume just quat9 + header2 for now (that's delta for Orientation)
+        // Configure ODR for quaternion output
+        const ODR_QUAT9: u16 = 10 * 16 + 8;
+        const ODR_CNTR_QUAT9: u16 = 8 * 16 + 8;
+        // Set to 0 for maximum rate (225Hz)
+        self.write_mems(ODR_QUAT9, &[0, 0]).await?;
+        self.write_mems(ODR_CNTR_QUAT9, &[0, 0]).await?;
 
         let event_control: u16 =
             DMP_MOTION_EVENT_CONTROL_ACCEL_CALIBR | DMP_MOTION_EVENT_CONTROL_GYRO_CALIBR;
-        // | DMP_MOTION_EVENT_CONTROL_COMPASS_CALIBR;
-        // | DMP_MOTION_EVENT_CONTROL_9AXIS;
-        const DMP_DATA_READY_ACCEL: u16 = 0x0002;
-        const DMP_DATA_READY_GYRO: u16 = 0x0001;
-        const DMP_DATA_READY_SECONDARY_COMPASS: u16 = 0x0008;
+
         let data_rdy_status: u16 = DMP_DATA_READY_ACCEL | DMP_DATA_READY_GYRO;
-        // | DMP_DATA_READY_SECONDARY_COMPASS;
-        let data_output_control = delta;
-        const DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY: u16 = 0x4000;
-        const DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY: u16 = 0x2000;
-        const DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY: u16 = 0x1000;
 
         let data_output_control_2 =
             DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY | DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY;
-        // | DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY;
+
+        // Write configurations in the correct order
         self.write_mems(DMP_DATA_OUT_CTL, &data_output_control.to_be_bytes())
             .await?;
         self.write_mems(DMP_DATA_OUT_CTL2, &data_output_control_2.to_be_bytes())
@@ -396,7 +416,9 @@ where
         self.write_mems(DMP_MOTION_EVENT_CTL, &event_control.to_be_bytes())
             .await?;
 
-        // self.set_low_power(true).await?;
+        // Reset FIFO
+        self.reset_fifo().await?;
+
         Ok(())
     }
 
@@ -407,8 +429,8 @@ where
         const ODR_CNTR_QUAT9: u16 = 8 * 16 + 8;
         // Can be changed based on this equation:
         // https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary/blob/9a10c510ddb694f08aa93c12d586358cb45abd2b/src/util/ICM_20948_C.c#L1621.
-        self.write_mems(ODR_QUAT9, &[0, 0]).await?;
-        self.write_mems(ODR_CNTR_QUAT9, &[0, 0]).await?;
+        // self.write_mems(ODR_QUAT9, &[0, 0]).await?;
+        // self.write_mems(ODR_CNTR_QUAT9, &[0, 0]).await?;
 
         const ODR_QUAT6: u16 = 10 * 16 + 12;
         const ODR_CNTR_QUAT6: u16 = 8 * 16 + 12;
@@ -493,11 +515,10 @@ where
         while write_start.len() > 0 {
             let mut write_size = write_start.len().min(MAX_SERIAL_WRITE);
             if (write_addr & 0xff) + (write_size as u16) > 0x100 {
-                write_size = ((write_addr & 0xff) + (write_size as u16) - 0x100) as usize;
-                // write_size = (0x100 - (write_addr & 0xff)) as usize;
+                write_size = (0x100 - (write_addr & 0xff)) as usize;
             }
             if write_size == 0 {
-                panic!("write size zero");
+                panic!("DMP firmware write size calculated as zero - this should never happen");
             }
             self.write_mems(write_addr, &write_start[..write_size])
                 .await?;
@@ -517,8 +538,8 @@ where
         while !expected_data.is_empty() {
             let mut read_len = expected_data.len().min(MAX_SERIAL_WRITE);
             if (read_loc & 0xff) + read_len > 0x100 {
-                // Moved across a bank
-                read_len = (read_loc & 0xff) + read_len - 0x100;
+                // Limit read to end of current bank
+                read_len = 0x100 - (read_loc & 0xff);
             }
             let mut buf = &mut [0u8; MAX_SERIAL_WRITE][..read_len];
             self.read_mems(read_loc as u16, &mut buf).await?;
@@ -647,6 +668,7 @@ where
     }
 
     pub async fn full_dmp_setup(&mut self) -> Result<(), IcmError<E>> {
+        self.set_sleep(false).await?;
         // Minimal setup from arduino lib
         // force bank 0 for first write
         //TODO: this fixes WHO_AM_I, instead make sure we make current bank an optional to distinguish from 0!!
@@ -680,7 +702,7 @@ where
 
     pub async fn read_dmp(
         &mut self,
-    ) -> Result<(Option<((f64, f64, f64), u16, (u32, u32, u32))>, Option<u16>), E> {
+    ) -> Result<(Option<((f64, f64, f64), u16, (i32, i32, i32))>, Option<u16>), E> {
         const MAX_DMP_BYTES: usize = 14;
         const DMP_HEADER_BYTES: u16 = 2u16;
         const DMP_HEADER2_BYTES: u16 = 2u16;
@@ -698,7 +720,7 @@ where
         const DMP_HEADER_BITMAP_COMPASS_CALIB: u16 = 0x0020;
         const DMP_HEADER_BITMAP_STEP_DETECTOR: u16 = 0x0010;
 
-        let mut out: Option<((f64, f64, f64), u16, (u32, u32, u32))> = None;
+        let mut out: Option<((f64, f64, f64), u16, (i32, i32, i32))> = None;
 
         let mut count = self.fifo_count().await?;
         if count < DMP_HEADER_BYTES {
@@ -736,34 +758,35 @@ where
             let _: [u8; 8] = self.fifo_read().await?;
         }
         if header & DMP_HEADER_BITMAP_QUAT6 > 0 {
-            // let _: [u8; 12] = self.fifo_read().await?;
             let quat6_bytes: [u8; 12] = self.fifo_read().await?;
             let q_ints = (
-                u32::from_be_bytes(quat6_bytes[0..4].try_into().unwrap()),
-                u32::from_be_bytes(quat6_bytes[4..8].try_into().unwrap()),
-                u32::from_be_bytes(quat6_bytes[8..12].try_into().unwrap()),
+                i32::from_be_bytes(quat6_bytes[0..4].try_into().unwrap()),
+                i32::from_be_bytes(quat6_bytes[4..8].try_into().unwrap()),
+                i32::from_be_bytes(quat6_bytes[8..12].try_into().unwrap()),
             );
-            let q1 =
-                u32::from_be_bytes(quat6_bytes[0..4].try_into().unwrap()) as f64 / 1073741824.0;
-            let q2 =
-                u32::from_be_bytes(quat6_bytes[4..8].try_into().unwrap()) as f64 / 1073741824.0;
-            let q3 =
-                u32::from_be_bytes(quat6_bytes[8..12].try_into().unwrap()) as f64 / 1073741824.0;
-            out = Some(((q1, q2, q3), 0, q_ints))
+            // info!("Raw quaternion components: {:?}", q_ints);
+
+            const QUAT_SCALE: f64 = 1073741824.0;
+            let q1 = q_ints.0 as f64 / QUAT_SCALE;
+            let q2 = q_ints.1 as f64 / QUAT_SCALE;
+            let q3 = q_ints.2 as f64 / QUAT_SCALE;
+
+            out = Some(((q1, q2, q3), 0, q_ints));
         }
         if header & DMP_HEADER_BITMAP_QUAT9 > 0 {
+            panic!();
             let quat9_bytes: [u8; 14] = self.fifo_read().await?;
             let q_ints = (
-                u32::from_be_bytes(quat9_bytes[0..4].try_into().unwrap()),
-                u32::from_be_bytes(quat9_bytes[4..8].try_into().unwrap()),
-                u32::from_be_bytes(quat9_bytes[8..12].try_into().unwrap()),
+                i32::from_be_bytes(quat9_bytes[0..4].try_into().unwrap()),
+                i32::from_be_bytes(quat9_bytes[4..8].try_into().unwrap()),
+                i32::from_be_bytes(quat9_bytes[8..12].try_into().unwrap()),
             );
             let q1 =
-                u32::from_be_bytes(quat9_bytes[0..4].try_into().unwrap()) as f64 / 1073741824.0;
+                i32::from_be_bytes(quat9_bytes[0..4].try_into().unwrap()) as f64 / 1073741824.0;
             let q2 =
-                u32::from_be_bytes(quat9_bytes[4..8].try_into().unwrap()) as f64 / 1073741824.0;
+                i32::from_be_bytes(quat9_bytes[4..8].try_into().unwrap()) as f64 / 1073741824.0;
             let q3 =
-                u32::from_be_bytes(quat9_bytes[8..12].try_into().unwrap()) as f64 / 1073741824.0;
+                i32::from_be_bytes(quat9_bytes[8..12].try_into().unwrap()) as f64 / 1073741824.0;
             use num_traits::Float as _;
             let q0: f64 = (1.0 - ((q1 * q1) + (q2 * q2) + (q3 * q3))).sqrt();
 
@@ -1012,3 +1035,51 @@ bitfield! {
     _ , set_addr: 6, 0;
     _ , set_rnw: 7;
 }
+
+// sensor output data rate: all 16-bit
+/// ODR_ACCEL Register for accel ODR
+pub const ODR_ACCEL: u16 = 11 * 16 + 14;
+/// ODR_GYRO Register for gyro ODR  
+pub const ODR_GYRO: u16 = 11 * 16 + 10;
+/// ODR_CPASS Register for compass ODR
+pub const ODR_CPASS: u16 = 11 * 16 + 6;
+/// ODR_ALS Register for ALS ODR
+pub const ODR_ALS: u16 = 11 * 16 + 2;
+/// ODR_QUAT6 Register for 6-axis quaternion ODR
+pub const ODR_QUAT6: u16 = 10 * 16 + 12;
+/// ODR_QUAT9 Register for 9-axis quaternion ODR
+pub const ODR_QUAT9: u16 = 10 * 16 + 8;
+/// ODR_PQUAT6 Register for 6-axis pedometer quaternion ODR
+pub const ODR_PQUAT6: u16 = 10 * 16 + 4;
+/// ODR_GEOMAG Register for Geomag rv ODR
+pub const ODR_GEOMAG: u16 = 10 * 16 + 0;
+/// ODR_PRESSURE Register for pressure ODR
+pub const ODR_PRESSURE: u16 = 11 * 16 + 12;
+/// ODR_GYRO_CALIBR Register for calibrated gyro ODR
+pub const ODR_GYRO_CALIBR: u16 = 11 * 16 + 8;
+/// ODR_CPASS_CALIBR Register for calibrated compass ODR
+pub const ODR_CPASS_CALIBR: u16 = 11 * 16 + 4;
+
+// sensor output data rate counter: all 16-bit
+/// ODR_CNTR_ACCEL Register for accel ODR counter
+pub const ODR_CNTR_ACCEL: u16 = 9 * 16 + 14;
+/// ODR_CNTR_GYRO Register for gyro ODR counter
+pub const ODR_CNTR_GYRO: u16 = 9 * 16 + 10;
+/// ODR_CNTR_CPASS Register for compass ODR counter
+pub const ODR_CNTR_CPASS: u16 = 9 * 16 + 6;
+/// ODR_CNTR_ALS Register for ALS ODR counter
+pub const ODR_CNTR_ALS: u16 = 9 * 16 + 2;
+/// ODR_CNTR_QUAT6 Register for 6-axis quaternion ODR counter
+pub const ODR_CNTR_QUAT6: u16 = 8 * 16 + 12;
+/// ODR_CNTR_QUAT9 Register for 9-axis quaternion ODR counter
+pub const ODR_CNTR_QUAT9: u16 = 8 * 16 + 8;
+/// ODR_CNTR_PQUAT6 Register for 6-axis pedometer quaternion ODR counter
+pub const ODR_CNTR_PQUAT6: u16 = 8 * 16 + 4;
+/// ODR_CNTR_GEOMAG Register for Geomag rv ODR counter
+pub const ODR_CNTR_GEOMAG: u16 = 8 * 16 + 0;
+/// ODR_CNTR_PRESSURE Register for pressure ODR counter
+pub const ODR_CNTR_PRESSURE: u16 = 9 * 16 + 12;
+/// ODR_CNTR_GYRO_CALIBR Register for calibrated gyro ODR counter
+pub const ODR_CNTR_GYRO_CALIBR: u16 = 9 * 16 + 8;
+/// ODR_CNTR_CPASS_CALIBR Register for calibrated compass ODR counter
+pub const ODR_CNTR_CPASS_CALIBR: u16 = 9 * 16 + 4;
