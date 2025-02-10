@@ -391,13 +391,6 @@ where
             .cloned()
             .ok_or(IcmError::DmpSetupError)?;
 
-        // Configure ODR for quaternion output
-        const ODR_QUAT9: u16 = 10 * 16 + 8;
-        const ODR_CNTR_QUAT9: u16 = 8 * 16 + 8;
-        // Set to 0 for maximum rate (225Hz)
-        self.write_mems(ODR_QUAT9, &[0, 0]).await?;
-        self.write_mems(ODR_CNTR_QUAT9, &[0, 0]).await?;
-
         let event_control: u16 =
             DMP_MOTION_EVENT_CONTROL_ACCEL_CALIBR | DMP_MOTION_EVENT_CONTROL_GYRO_CALIBR;
 
@@ -425,17 +418,13 @@ where
     pub async fn set_dmp_odr(&mut self) -> Result<(), E> {
         self.set_sleep(false).await?;
         self.set_low_power(false).await?;
-        const ODR_QUAT9: u16 = 10 * 16 + 8;
-        const ODR_CNTR_QUAT9: u16 = 8 * 16 + 8;
         // Can be changed based on this equation:
         // https://github.com/sparkfun/SparkFun_ICM-20948_ArduinoLibrary/blob/9a10c510ddb694f08aa93c12d586358cb45abd2b/src/util/ICM_20948_C.c#L1621.
-        // self.write_mems(ODR_QUAT9, &[0, 0]).await?;
-        // self.write_mems(ODR_CNTR_QUAT9, &[0, 0]).await?;
+        self.write_mems(ODR_QUAT9, &[0, 0]).await?;
+        self.write_mems(ODR_CNTR_QUAT9, &[0, 0]).await?;
 
-        const ODR_QUAT6: u16 = 10 * 16 + 12;
-        const ODR_CNTR_QUAT6: u16 = 8 * 16 + 12;
-        self.write_mems(ODR_QUAT6, &[0, 0]).await?;
-        self.write_mems(ODR_CNTR_QUAT6, &[0, 0]).await?;
+        // self.write_mems(ODR_QUAT6, &[0, 0]).await?;
+        // self.write_mems(ODR_CNTR_QUAT6, &[0, 0]).await?;
         self.set_low_power(true).await?;
 
         Ok(())
@@ -689,9 +678,8 @@ where
         self.set_sleep(false).await?;
         self.load_dmp().await?;
 
-        self.enable_dmp_sensor(DmpSensor::GameRotationVector)
-            .await?;
-        // self.enable_dmp_sensor(DmpSensor::Orientation).await?;
+        // self.enable_dmp_sensor(DmpSensor::GameRotationVector) .await?;
+        self.enable_dmp_sensor(DmpSensor::Orientation).await?;
         self.set_dmp_odr().await?;
         self.set_fifo(true).await?;
         self.set_dmp(true).await?;
