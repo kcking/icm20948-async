@@ -848,6 +848,16 @@ where
     async fn fifo_read<const N: usize>(&mut self) -> Result<[u8; N], E> {
         self.read_from(Bank0::FifoRW).await
     }
+    pub async fn enable_dmp_int(&mut self) -> Result<(), E> {
+        let [int_enable] = self.read_from(Bank0::IntEnable).await?;
+        let mut int = crate::interrupts::Icm20948IntEnable(int_enable);
+        int.set_dmp_int1_en(true);
+        int.set_i2c_mst_int_en(true);
+        int.set_reserved(0);
+        self.write_to(Bank0::IntEnable, int.0).await?;
+
+        Ok(())
+    }
 }
 
 bitfield! {

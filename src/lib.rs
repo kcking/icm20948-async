@@ -5,6 +5,7 @@ use embedded_hal_async::{delay::DelayNs, i2c::I2c, spi::SpiDevice};
 use nalgebra::Vector3;
 
 mod reg;
+mod interrupts;
 use crate::reg::*;
 
 mod dmp;
