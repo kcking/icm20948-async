@@ -15,11 +15,25 @@ use blob::DMP_FIRWARE_BLOB;
 const MAX_SERIAL_WRITE: usize = 16;
 const DMP_LOAD_START: u8 = 0x90;
 const DMP_START_ADDR: u16 = 0x1000;
-// Motion Event Control bits
-const DMP_MOTION_EVENT_CONTROL_ACCEL_CALIBR: u16 = 0x0001;
-const DMP_MOTION_EVENT_CONTROL_GYRO_CALIBR: u16 = 0x0002;
-const DMP_MOTION_EVENT_CONTROL_COMPASS_CALIBR: u16 = 0x0004;
-const DMP_MOTION_EVENT_CONTROL_9AXIS: u16 = 0x0008;
+
+#[derive(Debug, Clone, Copy)]
+#[repr(u16)]
+enum DmpMotionEventControlRegisterBits {
+    ActivityRecogPedomAccel = 0x0002, // Activity Recognition / Pedometer accel only
+    BringLookToSee = 0x0004,
+    Geomag = 0x0008, // Geomag rv
+    Pickup = 0x0010,
+    Bts = 0x0020,
+    NineAxis = 0x0040,
+    CompassCalibr = 0x0080,
+    GyroCalibr = 0x0100,
+    AccelCalibr = 0x0200,
+    SignificantMotionDet = 0x0800,
+    TiltInterrupt = 0x1000,
+    PedometerInterrupt = 0x2000,
+    ActivityRecogPedom = 0x4000,
+    BacWearable = 0x8000,
+}
 
 // Data Output Control 1 bits
 const DMP_OUTPUT_CTRL_1_QUAT6: u16 = 0x0800;
@@ -204,7 +218,7 @@ where
 
         Ok(())
     }
-    pub async fn load_dmp(&mut self) -> Result<(), E> {
+    pub async fn load_dmp(&mut self) -> Result<(), IcmError<E>> {
         self.configure_i2c(
             Peripheral::Zero,
             MAGNET_ADDR,
@@ -334,7 +348,6 @@ where
         // Configure the DMP Gyro Scaling Factor
         let [pll] = self.read_from(Bank1::TimebaseCorrectionPll).await?;
         // let pll = 0x18;
-        // panic!("pll: 0x{:x}", pll);
         const MAGIC_CONSTANT: u64 = 264446880937391;
         const MAGIC_CONSTANT_SCALE: u64 = 100000;
         const GYRO_LEVEL: u64 = 4; // hard-coded in arduino lib
@@ -379,7 +392,7 @@ where
         Ok(())
     }
 
-    pub async fn enable_dmp_sensor(&mut self, sensor: DmpSensor) -> Result<(), crate::IcmError<E>> {
+    pub async fn enable_dmp_sensor(&mut self, sensor: DmpSensor) -> Result<(), IcmError<E>> {
         self.set_low_power(false).await?;
 
         // Set gyro and accel FSR before configuring DMP
@@ -391,13 +404,18 @@ where
             .cloned()
             .ok_or(IcmError::DmpSetupError)?;
 
-        let event_control: u16 =
-            DMP_MOTION_EVENT_CONTROL_ACCEL_CALIBR | DMP_MOTION_EVENT_CONTROL_GYRO_CALIBR;
+        let event_control: u16 = DmpMotionEventControlRegisterBits::AccelCalibr as u16
+            | DmpMotionEventControlRegisterBits::CompassCalibr as u16
+            | DmpMotionEventControlRegisterBits::GyroCalibr as u16
+            // | DmpMotionEventControlRegisterBits::Geomag as u16 // not needed for 9dof
+            | DmpMotionEventControlRegisterBits::NineAxis as u16;
 
-        let data_rdy_status: u16 = DMP_DATA_READY_ACCEL | DMP_DATA_READY_GYRO;
+        let data_rdy_status: u16 =
+            DMP_DATA_READY_ACCEL | DMP_DATA_READY_GYRO | DMP_DATA_READY_SECONDARY_COMPASS;
 
-        let data_output_control_2 =
-            DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY | DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY;
+        let data_output_control_2 = DMP_DATA_OUTPUT_CONTROL_2_GYRO_ACCURACY
+            | DMP_DATA_OUTPUT_CONTROL_2_ACCEL_ACCURACY
+            | DMP_DATA_OUTPUT_CONTROL_2_COMPASS_ACCURACY;
 
         // Write configurations in the correct order
         self.write_mems(DMP_DATA_OUT_CTL, &data_output_control.to_be_bytes())
@@ -415,7 +433,7 @@ where
         Ok(())
     }
 
-    pub async fn set_dmp_odr(&mut self) -> Result<(), E> {
+    pub async fn set_dmp_odr(&mut self) -> Result<(), IcmError<E>> {
         self.set_sleep(false).await?;
         self.set_low_power(false).await?;
         // Can be changed based on this equation:
@@ -423,8 +441,6 @@ where
         self.write_mems(ODR_QUAT9, &[0, 0]).await?;
         self.write_mems(ODR_CNTR_QUAT9, &[0, 0]).await?;
 
-        // self.write_mems(ODR_QUAT6, &[0, 0]).await?;
-        // self.write_mems(ODR_CNTR_QUAT6, &[0, 0]).await?;
         self.set_low_power(true).await?;
 
         Ok(())
@@ -495,7 +511,7 @@ where
         Ok(())
     }
 
-    async fn load_dmp_firmware(&mut self) -> Result<(), E> {
+    async fn load_dmp_firmware(&mut self) -> Result<(), IcmError<E>> {
         self.set_low_power(false).await?;
 
         let data = DMP_FIRWARE_BLOB;
@@ -505,9 +521,6 @@ where
             let mut write_size = write_start.len().min(MAX_SERIAL_WRITE);
             if (write_addr & 0xff) + (write_size as u16) > 0x100 {
                 write_size = (0x100 - (write_addr & 0xff)) as usize;
-            }
-            if write_size == 0 {
-                panic!("DMP firmware write size calculated as zero - this should never happen");
             }
             self.write_mems(write_addr, &write_start[..write_size])
                 .await?;
@@ -520,7 +533,7 @@ where
         Ok(())
     }
 
-    async fn verify_dmp_firmware(&mut self) -> Result<(), E> {
+    async fn verify_dmp_firmware(&mut self) -> Result<(), IcmError<E>> {
         let mut expected_data = DMP_FIRWARE_BLOB;
         let mut read_loc = DMP_LOAD_START as usize;
 
@@ -533,21 +546,17 @@ where
             let mut buf = &mut [0u8; MAX_SERIAL_WRITE][..read_len];
             self.read_mems(read_loc as u16, &mut buf).await?;
             if buf != &expected_data[..read_len] {
-                panic!("OHNO");
+                return Err(IcmError::DmpSetupError);
             }
             expected_data = &expected_data[read_len..];
             read_loc += read_len;
         }
-        // panic!("DONE :) ");
 
         Ok(())
     }
 
-    async fn write_mems(&mut self, mut reg: u16, data: &[u8]) -> Result<(), E> {
+    async fn write_mems(&mut self, mut reg: u16, data: &[u8]) -> Result<(), IcmError<E>> {
         self.write_to(Bank0::MemBankSel, (reg >> 8) as u8).await?;
-        if (reg & 0xff) as usize + data.len() > 0x100 {
-            panic!();
-        }
 
         let mut bytes_written = 0;
         while bytes_written < data.len() {
@@ -565,7 +574,7 @@ where
             if let Some(next) = reg.checked_add(to_write as u16) {
                 reg = next;
             } else {
-                panic!("{}", bytes_written);
+                return Err(IcmError::DmpSetupError);
             }
             // NOTE: this loop is currently only ever executed once since the caller limits writes to MAX_SERIAL_WRITE
             reg += to_write as u16;
@@ -589,7 +598,7 @@ where
         Ok(())
     }
 
-    async fn set_low_power(&mut self, enable: bool) -> Result<(), E> {
+    async fn set_low_power(&mut self, enable: bool) -> Result<(), IcmError<E>> {
         let [pwr_mgmt] = self.read_from(Bank0::PwrMgmt1).await?;
         let mut pwr_mgmt = PwrMgmt1(pwr_mgmt);
         pwr_mgmt.set_lp_en(enable);
@@ -732,7 +741,7 @@ where
         } else {
             None
         };
-        // TODO: will these panic if fifo is not adequately filled?
+
         if header & DMP_HEADER_BITMAP_ACCEL > 0 {
             let _: [u8; 6] = self.fifo_read().await?;
         }
@@ -752,7 +761,6 @@ where
                 i32::from_be_bytes(quat6_bytes[4..8].try_into().unwrap()),
                 i32::from_be_bytes(quat6_bytes[8..12].try_into().unwrap()),
             );
-            // info!("Raw quaternion components: {:?}", q_ints);
 
             const QUAT_SCALE: f64 = 1073741824.0;
             let q1 = q_ints.0 as f64 / QUAT_SCALE;
@@ -762,7 +770,6 @@ where
             out = Some(((q1, q2, q3), 0, q_ints));
         }
         if header & DMP_HEADER_BITMAP_QUAT9 > 0 {
-            panic!();
             let quat9_bytes: [u8; 14] = self.fifo_read().await?;
             let q_ints = (
                 i32::from_be_bytes(quat9_bytes[0..4].try_into().unwrap()),
